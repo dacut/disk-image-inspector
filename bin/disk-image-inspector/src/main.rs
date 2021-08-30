@@ -4,7 +4,7 @@ use std::{
     env,
     error::Error,
     fs::File,
-    io::{stderr, stdout, BufReader, Read, Write},
+    io::{stderr, stdout, Read, Seek, Write},
     process::exit,
 };
 
@@ -12,6 +12,8 @@ mod bootsector;
 use bootsector::{BootSector, BOOT_SECTOR_SIGNATURE, BOOT_SECTOR_SIZE};
 mod errors;
 use errors::ImageError;
+mod gpt;
+use gpt::{GptHeader, GptPartitionEntry, MBR_GPT_PARTITION_TYPE};
 
 fn main() {
     env_logger::init();
@@ -57,7 +59,7 @@ fn main() {
 }
 
 fn run(image_filename: &str) -> Result<(), Box<dyn Error>> {
-    let image_unbuffered = match File::open(image_filename) {
+    let mut image = match File::open(image_filename) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("Unable to open {} for reading: {}", image_filename, e);
@@ -65,18 +67,14 @@ fn run(image_filename: &str) -> Result<(), Box<dyn Error>> {
         }
     };
 
-    let mut image = BufReader::new(image_unbuffered);
-    let mut mbr = [0u8; BOOT_SECTOR_SIZE];
-
-    match image.read_exact(&mut mbr) {
+    let boot_sector = match BootSector::new(&mut image, 0) {
         Err(e) => {
             eprintln!("Failed to read master boot record ({} bytes) from {}: {}", BOOT_SECTOR_SIZE, image_filename, e);
             return Err(e.into());
         }
-        Ok(()) => (),
-    }
+        Ok(bs) => bs,
+    };
 
-    let boot_sector = BootSector::new(&mbr);
     if &boot_sector.signature != BOOT_SECTOR_SIGNATURE {
         eprintln!(
             "Image does not start with a boot sector: expected [0x{:02x}, 0x{:02x}], got [0x{:02x}, 0x{:02x}]",
@@ -85,8 +83,56 @@ fn run(image_filename: &str) -> Result<(), Box<dyn Error>> {
         return Err(ImageError::InvalidSignature.into());
     }
 
+    if let Err(e) = print_mbr_partition_table(&mut image, &boot_sector, 0) {
+        eprintln!("Failed to get partition table: {}", e);
+        return Err(e.into());
+    }
+
+    let gpt_partition = &boot_sector.partitions[0];
+    if gpt_partition.partition_type.code == MBR_GPT_PARTITION_TYPE {
+        if let Err(e) = print_gpt_partition_table(&mut image, gpt_partition.lba_start as u64 * 512) {
+            eprintln!("Failed to get GPT partition table: {}", e);
+            return Err(e.into());
+        }
+    }
+
+    Ok(())
+}
+
+fn print_mbr_partition_table<R: Read + Seek>(
+    reader: &mut R,
+    boot_sector: &BootSector,
+    start_pos: u64,
+) -> Result<(), Box<dyn Error>> {
     for (i, ref partition) in boot_sector.partitions.iter().enumerate() {
-        println!("Partition {}:\n    {}", i + 1, format!("{}", partition).replace("\n", "\n    "));
+        if partition.partition_type.code > 0 {
+            println!("MBR Partition {}:\n    {}", i + 1, format!("{}", partition).replace("\n", "\n    "));
+        }
+    }
+
+    for partition in boot_sector.partitions.iter() {
+        if partition.is_extended() {
+            let (new_boot_sector, new_start_pos) = partition.get_extended_boot_sector(reader, start_pos)?;
+            print_mbr_partition_table(reader, &new_boot_sector, new_start_pos)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn print_gpt_partition_table<R: Read + Seek>(reader: &mut R, header_pos: u64) -> Result<(), Box<dyn Error>> {
+    let gpt_header = GptHeader::new(reader, header_pos)?;
+    let gpt_entry_table_pos = gpt_header.partition_table_lba as u64 * 512;
+
+    println!("GPT header:\n    {}", gpt_header.to_string().replace("\n", "\n    "));
+
+    for i in 0..gpt_header.partition_count {
+        let partition =
+            GptPartitionEntry::new(reader, gpt_entry_table_pos + gpt_header.partition_entry_size as u64 * i as u64)?;
+
+        if partition.partition_type.as_u128() != 0u128 {
+            println!("GPT Partition {}:\n    {}", i + 1, format!("{}", partition).replace("\n", "\n    "));
+        }
     }
 
     Ok(())
