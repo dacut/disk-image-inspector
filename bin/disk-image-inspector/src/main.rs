@@ -12,6 +12,8 @@ mod bootsector;
 use bootsector::{BootSector, BOOT_SECTOR_SIGNATURE, BOOT_SECTOR_SIZE};
 mod errors;
 use errors::ImageError;
+mod fat;
+use fat::{FatDirectoryEntry, FatPartition};
 mod gpt;
 use gpt::{GptHeader, GptPartitionEntry, MBR_GPT_PARTITION_TYPE};
 
@@ -58,6 +60,15 @@ fn main() {
     }
 }
 
+fn print_usage<W: Write>(program: &str, opts: &Options, writer: &mut W) {
+    let brief = format!(
+        "Inspect a disk image and show boot sector and partition information.\n\
+    Usage: {} [options] <image-filename>",
+        program
+    );
+    let _ = write!(writer, "{}", opts.usage(&brief));
+}
+
 fn run(image_filename: &str) -> Result<(), Box<dyn Error>> {
     let mut image = match File::open(image_filename) {
         Ok(f) => f,
@@ -67,7 +78,7 @@ fn run(image_filename: &str) -> Result<(), Box<dyn Error>> {
         }
     };
 
-    let boot_sector = match BootSector::new(&mut image, 0) {
+    let boot_sector = match BootSector::from_disk_image(&mut image, 0) {
         Err(e) => {
             eprintln!("Failed to read master boot record ({} bytes) from {}: {}", BOOT_SECTOR_SIZE, image_filename, e);
             return Err(e.into());
@@ -80,7 +91,7 @@ fn run(image_filename: &str) -> Result<(), Box<dyn Error>> {
             "Image does not start with a boot sector: expected [0x{:02x}, 0x{:02x}], got [0x{:02x}, 0x{:02x}]",
             BOOT_SECTOR_SIGNATURE[0], BOOT_SECTOR_SIGNATURE[1], boot_sector.signature[0], boot_sector.signature[1],
         );
-        return Err(ImageError::InvalidSignature.into());
+        return Err(ImageError::InvalidSignature(boot_sector.signature).into());
     }
 
     if let Err(e) = print_mbr_partition_table(&mut image, &boot_sector, 0) {
@@ -100,13 +111,40 @@ fn run(image_filename: &str) -> Result<(), Box<dyn Error>> {
 }
 
 fn print_mbr_partition_table<R: Read + Seek>(
-    reader: &mut R,
+    mut reader: &mut R,
     boot_sector: &BootSector,
     start_pos: u64,
 ) -> Result<(), Box<dyn Error>> {
     for (i, ref partition) in boot_sector.partitions.iter().enumerate() {
-        if partition.partition_type.code > 0 {
+        if partition.partition_type.code > 0 || partition.lba_start > 0 || partition.sector_count > 0 {
             println!("MBR Partition {}:\n    {}", i + 1, format!("{}", partition).replace("\n", "\n    "));
+
+            if !partition.is_extended() && partition.lba_start > 0 {
+                match FatPartition::from_partition_image(&mut reader, partition.lba_start as u64 * 512) {
+                    Ok(mut fp) => {
+                        println!(
+                            "    FAT Partition Information:\n        {}",
+                            format!("{}", fp.boot_sector).replace("\n", "\n        ")
+                        );
+
+                        match fp.get_root_directory_entries() {
+                            Ok(dir_entries) => {
+                                print_fat_directory(&mut fp, "/", dir_entries, 4);
+                            }
+                            Err(e) => {
+                                eprintln!("        Failed to get root directory entries: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => match e.downcast::<ImageError>() {
+                        Ok(ie) => match *ie {
+                            ImageError::InvalidSignature(_) => (),
+                            _ => return Err(ie.into()),
+                        },
+                        Err(e) => return Err(e.into()),
+                    },
+                }
+            }
         }
     }
 
@@ -120,7 +158,42 @@ fn print_mbr_partition_table<R: Read + Seek>(
     Ok(())
 }
 
-fn print_gpt_partition_table<R: Read + Seek>(reader: &mut R, header_pos: u64) -> Result<(), Box<dyn Error>> {
+fn print_fat_directory<R: Read + Seek>(
+    fp: &mut FatPartition<R>,
+    dir_name: &str,
+    dir_entries: Vec<FatDirectoryEntry>,
+    indent: usize,
+) {
+    let indent_str = " ".repeat(indent);
+    println!("{}Directory {}", indent_str, dir_name);
+
+    for dirent in &dir_entries {
+        if dirent.is_valid() {
+            println!("{}    {}", indent_str, dirent);
+        }
+    }
+
+    for dirent in &dir_entries {
+        if dirent.is_directory() {
+            if let Some(subdir_name) = dirent.get_filename() {
+                if subdir_name != "." && subdir_name != ".." {
+                    let subdir_path = format!("{}{}/", dir_name, subdir_name);
+                    match dirent.get_directory_entries(fp) {
+                        Ok(dir_entries) => print_fat_directory(fp, &subdir_path, dir_entries, indent + 4),
+                        Err(e) => {
+                            eprintln!("{}    Failed to get directory entries for {}: {}", indent_str, subdir_name, e)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn print_gpt_partition_table<R: Read + Seek>(
+    mut reader: &mut R,
+    header_pos: u64,
+) -> Result<(), Box<dyn Error + 'static>> {
     let gpt_header = GptHeader::new(reader, header_pos)?;
     let gpt_entry_table_pos = gpt_header.partition_table_lba as u64 * 512;
 
@@ -132,17 +205,24 @@ fn print_gpt_partition_table<R: Read + Seek>(reader: &mut R, header_pos: u64) ->
 
         if partition.partition_type.as_u128() != 0u128 {
             println!("GPT Partition {}:\n    {}", i + 1, format!("{}", partition).replace("\n", "\n    "));
+
+            match FatPartition::from_partition_image(&mut reader, partition.starting_lba as u64 * 512) {
+                Ok(fp) => {
+                    println!(
+                        "    FAT Partition Information:\n        {}",
+                        format!("{}", fp.boot_sector).replace("\n", "\n        ")
+                    );
+                }
+                Err(e) => match e.downcast::<ImageError>() {
+                    Ok(ie) => match *ie {
+                        ImageError::InvalidSignature(_) => (),
+                        _ => return Err(ie.into()),
+                    },
+                    Err(e) => return Err(e.into()),
+                },
+            }
         }
     }
 
     Ok(())
-}
-
-fn print_usage<W: Write>(program: &str, opts: &Options, writer: &mut W) {
-    let brief = format!(
-        "Inspect a disk image and show boot sector and partition information.\n\
-    Usage: {} [options] <image-filename>",
-        program
-    );
-    let _ = write!(writer, "{}", opts.usage(&brief));
 }

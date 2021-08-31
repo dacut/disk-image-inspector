@@ -10,7 +10,7 @@ pub(crate) enum ImageError {
     InvalidGptHeaderSize(u32),
     InvalidPartitionEntry(String),
     InvalidPartitionType { expected: String, actual: String },
-    InvalidSignature,
+    InvalidSignature([u8; 2]),
 }
 
 impl Display for ImageError {
@@ -29,7 +29,9 @@ impl Display for ImageError {
             Self::InvalidPartitionType { expected, actual } => {
                 write!(f, "Invalid partition type; expected {}, actual {}", expected, actual)
             }
-            Self::InvalidSignature => write!(f, "Invalid signature"),
+            Self::InvalidSignature(sig) => {
+                write!(f, "Invalid signature: expected [0x55, 0xaa], actual {}", hex::encode(sig))
+            }
         }
     }
 }

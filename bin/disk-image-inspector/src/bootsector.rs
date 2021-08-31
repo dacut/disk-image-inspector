@@ -23,7 +23,7 @@ pub struct BootSector {
 }
 
 impl BootSector {
-    pub fn new<R>(reader: &mut R, start_pos: u64) -> IoResult<Self>
+    pub fn from_disk_image<R>(reader: &mut R, start_pos: u64) -> IoResult<Self>
     where
         R: Read + Seek,
     {
@@ -454,7 +454,7 @@ impl PartitionEntry {
         }
 
         let start_pos = my_boot_sector_start_pos + self.lba_start as u64 * 512;
-        Ok((BootSector::new(reader, start_pos)?, start_pos))
+        Ok((BootSector::from_disk_image(reader, start_pos)?, start_pos))
     }
 
     pub fn is_extended(&self) -> bool {
